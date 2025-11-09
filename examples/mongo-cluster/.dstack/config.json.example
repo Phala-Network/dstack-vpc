@@ -1,0 +1,45 @@
+{
+  "os_image": "dstack-dev-0.5.4",
+  "vpc_server": {
+    "name": "mongodb-vpc-server",
+    "cpu": 1,
+    "memory": "2G",
+    "storage": "20G",
+    "composeFile": "vpc-server.yaml",
+    "appId": "e631a04a5d068c0e5ffd8ca60d6574ac99a10001"
+  },
+  "nodes": [
+    {
+      "appId": "e631a04a5d068c0e5ffd8ca60d6574ac99a10002",
+      "name": "mongodb-0",
+      "cpu": 2,
+      "memory": "8G",
+      "storage": "200G",
+      "composeFile": "mongodb.yaml"
+    },
+    {
+      "appId": "e631a04a5d068c0e5ffd8ca60d6574ac99a10002",
+      "name": "mongodb-1",
+      "cpu": 2,
+      "memory": "8G",
+      "storage": "200G",
+      "composeFile": "mongodb.yaml"
+    },
+    {
+      "appId": "e631a04a5d068c0e5ffd8ca60d6574ac99a10002",
+      "name": "mongodb-2",
+      "cpu": 2,
+      "memory": "8G",
+      "storage": "200G",
+      "composeFile": "mongodb.yaml"
+    },
+    {
+      "appId": "e631a04a5d068c0e5ffd8ca60d6574ac99a10003",
+      "name": "test-app-0",
+      "cpu": 1,
+      "memory": "2G",
+      "storage": "20G",
+      "composeFile": "mongo-app.yaml"
+    }
+  ]
+}

@@ -121,8 +121,33 @@ function renderFile(srcFile, dstFile, variables = {}) {
 
 function renderCompose(srcFile, deploymentDir, variables = {}) {
   const path = require('path');
+  const fs = require('fs');
   const dstFile = path.join(deploymentDir, "docker-compose.yml");
-  renderFile(srcFile, dstFile, variables);
+
+  // First render the variables
+  let content = fs.readFileSync(srcFile, 'utf8');
+  for (const [key, value] of Object.entries(variables)) {
+    const pattern = new RegExp(`\\$\\{${key}\\}`, 'g');
+    content = content.replace(pattern, value);
+  }
+
+  // Then replace VPC_NODE_NAME= patterns with the actual node name
+  // Extract node name from NODE_IND if available
+  const nodeInd = variables.NODE_IND || '0';
+  let nodeName = 'mongodb-' + nodeInd; // default
+
+  // Try to infer the actual node name from the file path or context
+  // For now, we'll use a simple heuristic based on the file content
+  if (content.includes('VPC_NODE_NAME=app-')) {
+    nodeName = 'test-app-' + nodeInd;
+  } else if (content.includes('VPC_NODE_NAME=mongodb-')) {
+    nodeName = 'mongodb-' + nodeInd;
+  }
+
+  // Replace VPC_NODE_NAME= patterns
+  content = content.replace(/VPC_NODE_NAME=[^\s\n]+/g, `VPC_NODE_NAME=${nodeName}`);
+
+  fs.writeFileSync(dstFile, content);
   return dstFile;
 }
 
