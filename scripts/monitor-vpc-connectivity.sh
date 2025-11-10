@@ -173,7 +173,11 @@ while true; do
 	failed_count=0
 	total_count=0
 
-	# Use process substitution to avoid subshell issue with pipe
+	# Create temporary directory for parallel ping results
+	temp_dir=$(mktemp -d)
+	trap "rm -rf $temp_dir" EXIT
+
+	# Launch parallel ping jobs
 	while read -r hostname; do
 		if [ -z "$hostname" ]; then
 			continue
@@ -181,10 +185,46 @@ while true; do
 
 		total_count=$((total_count + 1))
 
-		log "Checking node: $hostname"
+		# Run ping check in background
+		(
+			result=$(ping_node "$hostname" "$PING_COUNT" "$PING_TIMEOUT")
+			ts_result=""
 
-		# Try native ping first using hostname
-		result=$(ping_node "$hostname" "$PING_COUNT" "$PING_TIMEOUT")
+			if [ "$result" != "success" ]; then
+				# Try tailscale ping as fallback
+				ts_result=$(tailscale_ping_node "$hostname")
+			fi
+
+			# Write result to temp file
+			echo "$hostname|$result|$ts_result" >"$temp_dir/$hostname.result"
+		) &
+	done <<<"$node_list"
+
+	# Wait for all background jobs to complete with timeout
+	# Maximum wait time = PING_TIMEOUT + 5 seconds buffer
+	max_wait_time=$((PING_TIMEOUT * PING_COUNT + 10))
+	wait_start=$(date +%s)
+
+	while [ $(jobs -r | wc -l) -gt 0 ]; do
+		wait_elapsed=$(($(date +%s) - wait_start))
+		if [ $wait_elapsed -ge $max_wait_time ]; then
+			log "Warning: Timeout waiting for ping jobs, killing remaining processes"
+			jobs -p | xargs -r kill 2>/dev/null || true
+			break
+		fi
+		sleep 0.5
+	done
+
+	# Final wait to collect any remaining jobs
+	wait 2>/dev/null || true
+
+	# Process results
+	for result_file in "$temp_dir"/*.result; do
+		if [ ! -f "$result_file" ]; then
+			continue
+		fi
+
+		IFS='|' read -r hostname result ts_result <"$result_file"
 
 		if [ "$result" = "success" ]; then
 			log "  ✓ Native ping successful: $hostname"
@@ -192,8 +232,6 @@ while true; do
 		else
 			log "  ✗ Native ping failed: $hostname"
 
-			# Try tailscale ping as fallback (for logging only)
-			ts_result=$(tailscale_ping_node "$hostname")
 			if [ "$ts_result" = "success" ]; then
 				log "  ℹ Tailscale ping successful (but native failed): $hostname"
 			else
@@ -202,7 +240,10 @@ while true; do
 
 			failed_count=$((failed_count + 1))
 		fi
-	done <<<"$node_list"
+	done
+
+	# Clean up temp directory
+	rm -rf "$temp_dir"
 
 	log "Connectivity check complete: $success_count/$total_count nodes reachable (failed: $failed_count)"
 
@@ -214,7 +255,5 @@ while true; do
 	if [ "$failed_count" -eq "$total_count" ] && [ "$total_count" -gt 0 ]; then
 		run_network_diagnostics
 	fi
-
-	log "Next check in ${CHECK_INTERVAL} seconds"
 	sleep "$CHECK_INTERVAL"
 done

@@ -1,0 +1,6 @@
+# Ignore all files in .dstack directory except example files
+*
+!.gitignore
+!dstack.env.example
+!config.json.example
+
