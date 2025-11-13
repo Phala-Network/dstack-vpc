@@ -424,32 +424,17 @@ async fn proxy_request(
     state: &State<ClientState>,
     body: Option<Data<'_>>,
 ) -> Result<ProxyResponse, Status> {
-    // Extract target info from headers
-    let target = match extract_target_info(request) {
-        Some(t) => t,
-        None => {
-            debug!("Missing x-dstack-target-app header, delegating to dstack.sock");
-            return proxy_to_dstack_sock(request, body, state).await;
-        }
-    };
-
-    // Validate connection target before proceeding
-    validate_connection_target(&target)?;
-
     // Build target URL
-    let url = {
+    let (url, target_for_validation) = {
         let path = request.path.trim_start_matches('/');
         let full_path = match &request.query_string {
             Some(query) => format!("{}?{}", path, query),
             None => path.to_string(),
         };
 
-        // Priority 1: Use Host header if provided
-        if let Some(host) = &request.target_host {
-            debug!("Using Host header for target: {}", host);
-            format!("https://{host}/{full_path}")
-        } else {
-            // Priority 2: Use custom gateway or default gateway
+        // Priority 1: Use x-dstack-target-* headers if x-dstack-target-app is present
+        if let Some(target) = extract_target_info(request) {
+            // Use custom gateway or default gateway
             let gateway_domain = request
                 .target_gateway
                 .as_deref()
@@ -463,7 +448,7 @@ async fn proxy_request(
                 );
             }
 
-            if gateway_domain.starts_with("fixed/") {
+            let url = if gateway_domain.starts_with("fixed/") {
                 let domain = gateway_domain.trim_start_matches("fixed/");
                 format!("https://{domain}/{full_path}")
             } else {
@@ -474,9 +459,70 @@ async fn proxy_request(
                 };
                 let port = &target.port;
                 format!("https://{id}-{port}s.{gateway_domain}/{full_path}")
+            };
+
+            (url, Some(target))
+        }
+        // Priority 2: Use Host header if x-dstack-target-app is not present
+        // But only if it looks like a target service (contains gateway domain or looks like {id}-{port}s.{domain})
+        else if let Some(host) = &request.target_host {
+            // Check if Host looks like a target service hostname
+            // Valid patterns:
+            // - Contains the gateway domain
+            // - Matches pattern: {hex_id}-{port}s.{domain}
+            let gateway_domain = state.gateway_domain.trim_end_matches("/");
+            let is_target_host = host.contains(gateway_domain)
+                || (host.contains('.') && {
+                    // Check if it matches {id}-{port}s.{domain} pattern
+                    let first_segment = host.split('.').next().unwrap_or("");
+                    first_segment.contains('-')
+                        && first_segment.ends_with('s')
+                        && first_segment
+                            .split('-')
+                            .next()
+                            .map(|id| id.len() >= 32)
+                            .unwrap_or(false)
+                });
+
+            if is_target_host {
+                debug!("Using Host header for target: {}", host);
+                let url = format!("https://{host}/{full_path}");
+                // Extract app_id from host for validation if possible
+                // Format: {app_id}-{port}s.{gateway}
+                let app_id = host
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.split('-').next())
+                    .map(|s| s.to_string());
+
+                if let Some(app_id) = app_id {
+                    let target = TargetInfo {
+                        app_id,
+                        instance_id: String::new(),
+                        port: 443, // Default for Host header usage
+                    };
+                    (url, Some(target))
+                } else {
+                    // Can't extract app_id, but still allow the request
+                    debug!("Could not extract app_id from Host header, skipping validation");
+                    (url, None)
+                }
+            } else {
+                debug!("Host header '{}' does not look like a target service, delegating to dstack.sock", host);
+                return proxy_to_dstack_sock(request, body, state).await;
             }
         }
+        // Priority 3: Delegate to dstack.sock
+        else {
+            debug!("Missing x-dstack-target-app header and Host header, delegating to dstack.sock");
+            return proxy_to_dstack_sock(request, body, state).await;
+        }
     };
+
+    // Validate connection target if we have target info
+    if let Some(target) = &target_for_validation {
+        validate_connection_target(target)?;
+    }
 
     // Create HTTP client with TLS config
     // Note: For now using simple HTTP client, would need to configure mTLS properly
@@ -528,34 +574,47 @@ async fn proxy_request(
             let status = response.status();
 
             // Log successful connection with status code
-            debug!(
-                "Received response from app_id '{}' - status: {}, url: '{}'",
-                target.app_id, status, url
-            );
+            if let Some(target) = &target_for_validation {
+                debug!(
+                    "Received response from app_id '{}' - status: {}, url: '{}'",
+                    target.app_id, status, url
+                );
+            } else {
+                debug!("Received response - status: {}, url: '{}'", status, url);
+            }
 
             // TODO: It should be verified before sending the request. But reqwest doesn't support it.
-            if let Err(err) = verify_response_security(&response, &target)
-                .context("Failed to verify response security")
-            {
-                warn!(
-                    "Failed to verify response security for app_id '{}': {err:?}",
-                    target.app_id
-                );
-                return Ok(ProxyResponse::Error(ErrorResponse {
-                    status: Status::new(526),
-                    status_text: "Invalid SSL Certificate".to_string(),
-                    error_type: "SSL_VERIFICATION_FAILED".to_string(),
-                    message: "Failed to verify peer certificate".to_string(),
-                    details: Some(format!("{:#}", err)),
-                }));
+            if let Some(target) = &target_for_validation {
+                if let Err(err) = verify_response_security(&response, target)
+                    .context("Failed to verify response security")
+                {
+                    warn!(
+                        "Failed to verify response security for app_id '{}': {err:?}",
+                        target.app_id
+                    );
+                    return Ok(ProxyResponse::Error(ErrorResponse {
+                        status: Status::new(526),
+                        status_text: "Invalid SSL Certificate".to_string(),
+                        error_type: "SSL_VERIFICATION_FAILED".to_string(),
+                        message: "Failed to verify peer certificate".to_string(),
+                        details: Some(format!("{:#}", err)),
+                    }));
+                }
             }
 
             // Log if upstream returned an error status
             if status.is_client_error() || status.is_server_error() {
-                warn!(
-                    "Upstream returned error status - app_id: '{}', status: {}, url: '{}'",
-                    target.app_id, status, url
-                );
+                if let Some(target) = &target_for_validation {
+                    warn!(
+                        "Upstream returned error status - app_id: '{}', status: {}, url: '{}'",
+                        target.app_id, status, url
+                    );
+                } else {
+                    warn!(
+                        "Upstream returned error status - status: {}, url: '{}'",
+                        status, url
+                    );
+                }
             }
 
             // Return the response directly for streaming - no buffering!
@@ -648,13 +707,22 @@ async fn proxy_request(
             let root_cause = error_chain.last().unwrap_or(&error_chain[0]);
 
             // Log error with clean format
-            tracing::error!(
-                "mTLS request failed [{}]: {} (app_id: '{}', url: '{}')",
-                error_type,
-                root_cause,
-                target.app_id,
-                url
-            );
+            if let Some(target) = &target_for_validation {
+                tracing::error!(
+                    "mTLS request failed [{}]: {} (app_id: '{}', url: '{}')",
+                    error_type,
+                    root_cause,
+                    target.app_id,
+                    url
+                );
+            } else {
+                tracing::error!(
+                    "mTLS request failed [{}]: {} (url: '{}')",
+                    error_type,
+                    root_cause,
+                    url
+                );
+            }
 
             // Additional debug info with full chain
             if error_chain.len() > 1 {
