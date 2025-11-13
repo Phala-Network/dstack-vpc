@@ -182,6 +182,8 @@ pub struct DstackRequest {
     pub target_app: Option<String>,
     pub target_port: Option<String>,
     pub target_instance: Option<String>,
+    pub target_gateway: Option<String>,
+    pub target_host: Option<String>,
     pub all_headers: Vec<(String, String)>,
     pub query_string: Option<String>,
     pub path: String,
@@ -203,6 +205,10 @@ impl<'r> FromRequest<'r> for DstackRequest {
         let target_instance = headers
             .get_one("x-dstack-target-instance")
             .map(|s| s.to_string());
+        let target_gateway = headers
+            .get_one("x-dstack-target-gateway")
+            .map(|s| s.to_string());
+        let target_host = headers.get_one("host").map(|s| s.to_string());
 
         let all_headers = headers
             .iter()
@@ -221,6 +227,8 @@ impl<'r> FromRequest<'r> for DstackRequest {
             target_app,
             target_port,
             target_instance,
+            target_gateway,
+            target_host,
             all_headers,
             query_string,
             path,
@@ -435,19 +443,38 @@ async fn proxy_request(
             Some(query) => format!("{}?{}", path, query),
             None => path.to_string(),
         };
-        let gateway_domain = state.gateway_domain.trim_end_matches("/");
 
-        if gateway_domain.starts_with("fixed/") {
-            let domain = gateway_domain.trim_start_matches("fixed/");
-            format!("https://{domain}/{full_path}")
+        // Priority 1: Use Host header if provided
+        if let Some(host) = &request.target_host {
+            debug!("Using Host header for target: {}", host);
+            format!("https://{host}/{full_path}")
         } else {
-            let id = if target.instance_id.is_empty() {
-                &target.app_id
+            // Priority 2: Use custom gateway or default gateway
+            let gateway_domain = request
+                .target_gateway
+                .as_deref()
+                .unwrap_or(&state.gateway_domain)
+                .trim_end_matches("/");
+
+            if let Some(custom_gw) = &request.target_gateway {
+                debug!(
+                    "Using custom gateway '{}' (overriding default '{}')",
+                    custom_gw, state.gateway_domain
+                );
+            }
+
+            if gateway_domain.starts_with("fixed/") {
+                let domain = gateway_domain.trim_start_matches("fixed/");
+                format!("https://{domain}/{full_path}")
             } else {
-                &target.instance_id
-            };
-            let port = &target.port;
-            format!("https://{id}-{port}s.{gateway_domain}/{full_path}")
+                let id = if target.instance_id.is_empty() {
+                    &target.app_id
+                } else {
+                    &target.instance_id
+                };
+                let port = &target.port;
+                format!("https://{id}-{port}s.{gateway_domain}/{full_path}")
+            }
         }
     };
 
