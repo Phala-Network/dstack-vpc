@@ -14,6 +14,7 @@ use rocket::request::{self, FromRequest};
 use rocket::response::{Responder, Response};
 use rocket::tokio::io::AsyncRead;
 use rocket::{get, post, routes, Data, Request, State};
+use std::error::Error;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::AsyncReadExt;
@@ -93,6 +94,15 @@ impl AsyncRead for ReqwestStreamReader {
 pub enum ProxyResponse {
     Stream(StreamingProxyResponse),
     Json(serde_json::Value),
+    Error(ErrorResponse),
+}
+
+pub struct ErrorResponse {
+    status: Status,
+    status_text: String,
+    error_type: String,
+    message: String,
+    details: Option<String>,
 }
 
 pub struct StreamingProxyResponse {
@@ -110,12 +120,35 @@ impl<'r> Responder<'r, 'static> for ProxyResponse {
                     .sized_body(json_string.len(), std::io::Cursor::new(json_string))
                     .ok()
             }
+            ProxyResponse::Error(error) => error.respond_to(request),
         }
+    }
+}
+
+impl<'r> Responder<'r, 'static> for ErrorResponse {
+    fn respond_to(self, _: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+        let error_json = serde_json::json!({
+            "status": self.status.code,
+            "status_text": self.status_text,
+            "error": self.error_type,
+            "message": self.message,
+            "details": self.details,
+        });
+        let json_string = serde_json::to_string(&error_json).unwrap_or_default();
+
+        Response::build()
+            .status(self.status)
+            .header(rocket::http::ContentType::JSON)
+            .sized_body(json_string.len(), std::io::Cursor::new(json_string))
+            .ok()
     }
 }
 
 impl<'r> Responder<'r, 'static> for StreamingProxyResponse {
     fn respond_to(self, _: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+        // Capture status code before moving the response
+        let status_code = self.response.status();
+
         // Collect all headers before moving the response
         let headers: Vec<(String, String)> = self
             .response
@@ -131,6 +164,9 @@ impl<'r> Responder<'r, 'static> for StreamingProxyResponse {
         let reader = ReqwestStreamReader::new(self.response);
 
         let mut response_builder = Response::build();
+
+        // Set the upstream status code
+        response_builder.status(Status::from_code(status_code.as_u16()).unwrap_or(Status::Ok));
 
         // Add all headers from the upstream response
         for (name, value) in headers {
@@ -462,19 +498,150 @@ async fn proxy_request(
     // Execute request
     match request_builder.send().await {
         Ok(response) => {
+            let status = response.status();
+
+            // Log successful connection with status code
+            debug!(
+                "Received response from app_id '{}' - status: {}, url: '{}'",
+                target.app_id, status, url
+            );
+
             // TODO: It should be verified before sending the request. But reqwest doesn't support it.
             if let Err(err) = verify_response_security(&response, &target)
                 .context("Failed to verify response security")
             {
-                warn!("Failed to verify response security: {err:?}");
-                return Err(Status::BadGateway);
+                warn!(
+                    "Failed to verify response security for app_id '{}': {err:?}",
+                    target.app_id
+                );
+                return Ok(ProxyResponse::Error(ErrorResponse {
+                    status: Status::new(526),
+                    status_text: "Invalid SSL Certificate".to_string(),
+                    error_type: "SSL_VERIFICATION_FAILED".to_string(),
+                    message: "Failed to verify peer certificate".to_string(),
+                    details: Some(format!("{:#}", err)),
+                }));
             }
+
+            // Log if upstream returned an error status
+            if status.is_client_error() || status.is_server_error() {
+                warn!(
+                    "Upstream returned error status - app_id: '{}', status: {}, url: '{}'",
+                    target.app_id, status, url
+                );
+            }
+
             // Return the response directly for streaming - no buffering!
             Ok(ProxyResponse::Stream(StreamingProxyResponse { response }))
         }
         Err(e) => {
-            tracing::error!("mTLS request to app_id '{}' failed: {}", target.app_id, e);
-            Err(Status::BadGateway)
+            // Collect all error messages in the chain
+            let mut error_chain = Vec::new();
+            let mut source = Some(&e as &dyn Error);
+            while let Some(err) = source {
+                error_chain.push(err.to_string());
+                source = err.source();
+                if error_chain.len() > 10 {
+                    break; // Prevent infinite loops
+                }
+            }
+
+            // Classify error type
+            let (error_type, user_message, status_code, status_text) = if e.is_timeout() {
+                (
+                    "TIMEOUT",
+                    "Request timeout",
+                    Status::GatewayTimeout,
+                    "Gateway Timeout".to_string(),
+                )
+            } else if e.is_connect() {
+                // Check if it's a TLS/certificate error
+                let error_str = error_chain.join(" | ");
+                if error_str.contains("certificate")
+                    || error_str.contains("SSL")
+                    || error_str.contains("TLS")
+                {
+                    if error_str.contains("UnknownIssuer") {
+                        (
+                            "SSL_UNKNOWN_ISSUER",
+                            "SSL certificate verification failed: Unknown certificate issuer",
+                            Status::new(526),
+                            "Invalid SSL Certificate".to_string(),
+                        )
+                    } else if error_str.contains("CertExpired") || error_str.contains("expired") {
+                        (
+                            "SSL_CERT_EXPIRED",
+                            "SSL certificate has expired",
+                            Status::new(526),
+                            "Invalid SSL Certificate".to_string(),
+                        )
+                    } else {
+                        (
+                            "SSL_HANDSHAKE_FAILED",
+                            "SSL/TLS handshake failed",
+                            Status::new(525),
+                            "SSL Handshake Failed".to_string(),
+                        )
+                    }
+                } else {
+                    (
+                        "CONNECTION_FAILED",
+                        "Failed to connect to upstream server",
+                        Status::BadGateway,
+                        "Bad Gateway".to_string(),
+                    )
+                }
+            } else if e.is_request() {
+                (
+                    "REQUEST_ERROR",
+                    "Request construction failed",
+                    Status::BadRequest,
+                    "Bad Request".to_string(),
+                )
+            } else if let Some(status) = e.status() {
+                let rocket_status =
+                    Status::from_code(status.as_u16()).unwrap_or(Status::BadGateway);
+                let status_text = rocket_status.reason().unwrap_or("Unknown").to_string();
+                (
+                    "HTTP_ERROR",
+                    "Upstream HTTP error",
+                    rocket_status,
+                    status_text,
+                )
+            } else {
+                (
+                    "UNKNOWN",
+                    "Unknown error occurred",
+                    Status::BadGateway,
+                    "Bad Gateway".to_string(),
+                )
+            };
+
+            // Find the root cause (last error in chain)
+            let root_cause = error_chain.last().unwrap_or(&error_chain[0]);
+
+            // Log error with clean format
+            tracing::error!(
+                "mTLS request failed [{}]: {} (app_id: '{}', url: '{}')",
+                error_type,
+                root_cause,
+                target.app_id,
+                url
+            );
+
+            // Additional debug info with full chain
+            if error_chain.len() > 1 {
+                tracing::debug!("Error chain: {}", error_chain.join(" → "));
+            }
+            tracing::debug!("Full error details: {:#?}", e);
+
+            Ok(ProxyResponse::Error(ErrorResponse {
+                status: status_code,
+                status_text,
+                error_type: error_type.to_string(),
+                message: user_message.to_string(),
+                details: Some(error_chain.join(" → ")),
+            }))
         }
     }
 }
@@ -503,14 +670,62 @@ fn extract_target_info(request: &DstackRequest) -> Option<TargetInfo> {
 /// Create an HTTP client configured with mTLS using certificates from files
 fn create_mtls_client(config: &Config) -> Result<Client> {
     use fs_err as fs;
-    let key_pem = fs::read_to_string(&config.tls.key_file).context("Failed to read key file")?;
-    let cert_pem = fs::read_to_string(&config.tls.cert_file).context("Failed to read cert file")?;
-    let ca_pem = fs::read_to_string(&config.tls.ca_file).context("Failed to read CA file")?;
+
+    info!(
+        "Loading mTLS certificates - key: '{}', cert: '{}', ca: '{}'",
+        config.tls.key_file, config.tls.cert_file, config.tls.ca_file
+    );
+
+    let key_pem = fs::read_to_string(&config.tls.key_file)
+        .with_context(|| format!("Failed to read key file: {}", config.tls.key_file))?;
+    let cert_pem = fs::read_to_string(&config.tls.cert_file)
+        .with_context(|| format!("Failed to read cert file: {}", config.tls.cert_file))?;
+    let ca_pem = fs::read_to_string(&config.tls.ca_file)
+        .with_context(|| format!("Failed to read CA file: {}", config.tls.ca_file))?;
+
+    // Parse and log client certificate info
+    for pem in x509_parser::pem::Pem::iter_from_buffer(cert_pem.as_bytes()).flatten() {
+        if let Ok((_, client_cert)) = x509_parser::parse_x509_certificate(&pem.contents) {
+            let subject = client_cert.subject().to_string();
+            let issuer = client_cert.issuer().to_string();
+            info!(
+                "Client certificate loaded - subject: '{}', issuer: '{}'",
+                subject, issuer
+            );
+            break;
+        }
+    }
+
+    // Parse and log CA certificate info
+    let ca_certs: Vec<_> = x509_parser::pem::Pem::iter_from_buffer(ca_pem.as_bytes())
+        .filter_map(|p| p.ok())
+        .collect();
+    info!("Loaded {} CA certificate(s)", ca_certs.len());
+
+    for (i, ca_cert_pem) in ca_certs.iter().enumerate() {
+        if let Ok((_, ca_cert)) = x509_parser::parse_x509_certificate(&ca_cert_pem.contents) {
+            let subject = ca_cert.subject().to_string();
+            let issuer = ca_cert.issuer().to_string();
+            let not_before = ca_cert.validity().not_before;
+            let not_after = ca_cert.validity().not_after;
+            info!(
+                "CA certificate [{}] - subject: '{}', issuer: '{}', valid: {} to {}",
+                i + 1,
+                subject,
+                issuer,
+                not_before,
+                not_after
+            );
+        }
+    }
 
     // Try using the full certificate chain instead of just the leaf certificate
     let identity_pem = format!("{}\n{}", cert_pem, key_pem);
     let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())?;
     let ca = reqwest::Certificate::from_pem(ca_pem.as_bytes())?;
+
+    info!("Building mTLS HTTP client with custom CA trust");
+
     let client = Client::builder()
         .use_rustls_tls() // Force rustls backend
         .identity(identity)
@@ -525,6 +740,9 @@ fn create_mtls_client(config: &Config) -> Result<Client> {
         .hickory_dns(true)
         .build()
         .context("Failed to build mTLS HTTP client")?;
+
+    info!("mTLS HTTP client created successfully");
+
     Ok(client)
 }
 
@@ -553,14 +771,6 @@ fn validate_connection_target(target: &TargetInfo) -> Result<(), Status> {
 
 /// Verify response security and log connection info
 fn verify_response_security(response: &reqwest::Response, target: &TargetInfo) -> Result<()> {
-    // Log successful mTLS connection
-    info!(
-        "mTLS connection established successfully - app_id: {}, port: {}, status: {}",
-        target.app_id,
-        target.port,
-        response.status()
-    );
-
     let Some(tls_info) = response.extensions().get::<TlsInfo>() else {
         bail!("No TLS info in response");
     };
@@ -570,17 +780,47 @@ fn verify_response_security(response: &reqwest::Response, target: &TargetInfo) -
 
     let (_, parsed_cert) =
         x509_parser::parse_x509_certificate(cert).context("Failed to parse certificate")?;
+
+    // Extract certificate information for logging
+    let subject = parsed_cert.subject().to_string();
+    let issuer = parsed_cert.issuer().to_string();
+    let not_before = parsed_cert.validity().not_before;
+    let not_after = parsed_cert.validity().not_after;
+
+    debug!(
+        "Server certificate info - subject: '{}', issuer: '{}', valid: {} to {}",
+        subject, issuer, not_before, not_after
+    );
+
     let app_id = parsed_cert
         .get_app_id()
         .context("Failed to get app id")?
         .context("Missing app id in server certificate")?;
-    let app_id = hex::encode(app_id);
-    if app_id.to_lowercase() != target.app_id.to_lowercase() {
+    let cert_app_id = hex::encode(app_id);
+
+    debug!(
+        "Certificate app_id verification - expected: '{}', got: '{}'",
+        target.app_id, cert_app_id
+    );
+
+    if cert_app_id.to_lowercase() != target.app_id.to_lowercase() {
         bail!(
-            "Server app_id mismatch: expected '{}', got '{}'",
+            "Server app_id mismatch: expected '{}', got '{}' (subject: '{}', issuer: '{}')",
             target.app_id,
-            app_id
+            cert_app_id,
+            subject,
+            issuer
         );
     }
+
+    // Log successful mTLS connection with verification details
+    info!(
+        "mTLS connection verified - app_id: {}, port: {}, status: {}, cert_subject: '{}'",
+        target.app_id,
+        target.port,
+        response.status(),
+        subject
+    );
+
     Ok(())
 }
