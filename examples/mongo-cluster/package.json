@@ -1,0 +1,14 @@
+{
+  "name": "mongo-cluster",
+  "version": "1.0.0",
+  "description": "Spin up a MongoDB replica set inside a DStack VPC using the Phala Cloud CLI.",
+  "main": "deploy-to-dstack.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@phala/cloud": "^0.2.1-beta.4"
+  }
+}
