@@ -146,6 +146,8 @@ pub struct DstackRequest {
     pub target_app: Option<String>,
     pub target_port: Option<String>,
     pub target_instance: Option<String>,
+    pub target_gateway: Option<String>,
+    pub target_host: Option<String>,
     pub all_headers: Vec<(String, String)>,
     pub query_string: Option<String>,
     pub path: String,
@@ -167,6 +169,12 @@ impl<'r> FromRequest<'r> for DstackRequest {
         let target_instance = headers
             .get_one("x-dstack-target-instance")
             .map(|s| s.to_string());
+        let target_gateway = headers
+            .get_one("x-dstack-target-gateway")
+            .map(|s| s.to_string());
+        let target_host = headers
+            .get_one("x-dstack-target-host")
+            .map(|s| s.to_string());
 
         let all_headers = headers
             .iter()
@@ -185,6 +193,8 @@ impl<'r> FromRequest<'r> for DstackRequest {
             target_app,
             target_port,
             target_instance,
+            target_gateway,
+            target_host,
             all_headers,
             query_string,
             path,
@@ -380,40 +390,105 @@ async fn proxy_request(
     state: &State<ClientState>,
     body: Option<Data<'_>>,
 ) -> Result<ProxyResponse, Status> {
-    // Extract target info from headers
-    let target = match extract_target_info(request) {
-        Some(t) => t,
-        None => {
-            debug!("Missing x-dstack-target-app header, delegating to dstack.sock");
-            return proxy_to_dstack_sock(request, body, state).await;
-        }
-    };
-
-    // Validate connection target before proceeding
-    validate_connection_target(&target)?;
-
     // Build target URL
-    let url = {
+    let (url, target_for_validation) = {
         let path = request.path.trim_start_matches('/');
         let full_path = match &request.query_string {
             Some(query) => format!("{}?{}", path, query),
             None => path.to_string(),
         };
-        let gateway_domain = state.gateway_domain.trim_end_matches("/");
 
-        if gateway_domain.starts_with("fixed/") {
-            let domain = gateway_domain.trim_start_matches("fixed/");
-            format!("https://{domain}/{full_path}")
-        } else {
-            let id = if target.instance_id.is_empty() {
-                &target.app_id
+        // Priority 1: Use x-dstack-target-* headers if x-dstack-target-app is present
+        if let Some(target) = extract_target_info(request) {
+            // Use custom gateway or default gateway
+            let gateway_domain = request
+                .target_gateway
+                .as_deref()
+                .unwrap_or(&state.gateway_domain)
+                .trim_end_matches("/");
+
+            if let Some(custom_gw) = &request.target_gateway {
+                debug!(
+                    "Using custom gateway '{}' (overriding default '{}')",
+                    custom_gw, state.gateway_domain
+                );
+            }
+
+            let url = if gateway_domain.starts_with("fixed/") {
+                let domain = gateway_domain.trim_start_matches("fixed/");
+                format!("https://{domain}/{full_path}")
             } else {
-                &target.instance_id
+                let id = if target.instance_id.is_empty() {
+                    &target.app_id
+                } else {
+                    &target.instance_id
+                };
+                let port = &target.port;
+                format!("https://{id}-{port}s.{gateway_domain}/{full_path}")
             };
-            let port = &target.port;
-            format!("https://{id}-{port}s.{gateway_domain}/{full_path}")
+
+            (url, Some(target))
+        }
+        // Priority 2: Use x-dstack-target-host header if x-dstack-target-app is not present
+        // But only if it looks like a target service (contains gateway domain or looks like {id}-{port}s.{domain})
+        else if let Some(host) = &request.target_host {
+            // Check if target_host looks like a target service hostname
+            // Valid patterns:
+            // - Contains the gateway domain
+            // - Matches pattern: {hex_id}-{port}s.{domain}
+            let gateway_domain = state.gateway_domain.trim_end_matches("/");
+            let is_target_host = host.contains(gateway_domain)
+                || (host.contains('.') && {
+                    // Check if it matches {id}-{port}s.{domain} pattern
+                    let first_segment = host.split('.').next().unwrap_or("");
+                    first_segment.contains('-')
+                        && first_segment.ends_with('s')
+                        && first_segment
+                            .split('-')
+                            .next()
+                            .map(|id| id.len() >= 32)
+                            .unwrap_or(false)
+                });
+
+            if is_target_host {
+                debug!("Using x-dstack-target-host header for target: {}", host);
+                let url = format!("https://{host}/{full_path}");
+                // Extract app_id from host for validation if possible
+                // Format: {app_id}-{port}s.{gateway}
+                let app_id = host
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.split('-').next())
+                    .map(|s| s.to_string());
+
+                if let Some(app_id) = app_id {
+                    let target = TargetInfo {
+                        app_id,
+                        instance_id: String::new(),
+                        port: 443, // Default for x-dstack-target-host header usage
+                    };
+                    (url, Some(target))
+                } else {
+                    // Can't extract app_id, but still allow the request
+                    debug!("Could not extract app_id from x-dstack-target-host header, skipping validation");
+                    (url, None)
+                }
+            } else {
+                debug!("x-dstack-target-host header '{}' does not look like a target service, delegating to dstack.sock", host);
+                return proxy_to_dstack_sock(request, body, state).await;
+            }
+        }
+        // Priority 3: Delegate to dstack.sock
+        else {
+            debug!("Missing x-dstack-target-app header and x-dstack-target-host header, delegating to dstack.sock");
+            return proxy_to_dstack_sock(request, body, state).await;
         }
     };
+
+    // Validate connection target if we have target info
+    if let Some(target) = &target_for_validation {
+        validate_connection_target(target)?;
+    }
 
     // Create HTTP client with TLS config
     // Note: For now using simple HTTP client, would need to configure mTLS properly
@@ -463,17 +538,23 @@ async fn proxy_request(
     match request_builder.send().await {
         Ok(response) => {
             // TODO: It should be verified before sending the request. But reqwest doesn't support it.
-            if let Err(err) = verify_response_security(&response, &target)
-                .context("Failed to verify response security")
-            {
-                warn!("Failed to verify response security: {err:?}");
-                return Err(Status::BadGateway);
+            if let Some(target) = &target_for_validation {
+                if let Err(err) = verify_response_security(&response, target)
+                    .context("Failed to verify response security")
+                {
+                    warn!("Failed to verify response security: {err:?}");
+                    return Err(Status::BadGateway);
+                }
             }
             // Return the response directly for streaming - no buffering!
             Ok(ProxyResponse::Stream(StreamingProxyResponse { response }))
         }
         Err(e) => {
-            tracing::error!("mTLS request to app_id '{}' failed: {}", target.app_id, e);
+            if let Some(target) = &target_for_validation {
+                tracing::error!("mTLS request to app_id '{}' failed: {}", target.app_id, e);
+            } else {
+                tracing::error!("mTLS request failed: {}", e);
+            }
             Err(Status::BadGateway)
         }
     }
