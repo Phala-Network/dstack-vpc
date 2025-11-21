@@ -247,24 +247,45 @@ curl "${API_BASE_URL}/api/register?instance_id=test-001&node_name=my-node" \
 
 ## Headscale API Proxy (for operations)
 
-The VPC API Server proxies requests to the Headscale control server. This allows administrators to manage the Headscale infrastructure through a unified endpoint.
+The VPC API Server exposes a curated subset of Headscale APIs to administrators. Every `/api/v1/*` request:
 
-**Reference:** [Headscale API Documentation](https://github.com/juanfont/headscale/blob/main/docs/ref/api.md)
+1. **Must appear in the whitelist** below (other endpoints return `403`)
+2. **Must carry the wallet signature headers** described in the Admin API section (nonce + UTC timestamp + `Authorization: Bearer <signature>`)
+3. **Is forwarded with the internal `HEADSCALE_API_KEY`**. Administrators never send the Headscale key directly.
 
-### Endpoints
+### Supported endpoints
 
-- `GET /api/v1/node` - Proxy to Headscale node list with `app_id` injection
-- `ANY /api/v1/*` - Transparent proxy to any Headscale API endpoint
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/node` | List nodes (response is augmented with `app_id` for each node) |
+| `GET` | `/api/v1/node/:nodeId` | Fetch a single node |
+| `DELETE` | `/api/v1/node/:nodeId` | Delete a node |
+| `POST` | `/api/v1/node/:nodeId/tags` | Update node tags |
+| `POST` | `/api/v1/node/:nodeId/approve_routes` | Approve advertised routes |
+| `GET` | `/api/v1/policy` | Retrieve the ACL / policy document |
+| `PUT` | `/api/v1/policy` | Update the ACL / policy document |
+| `GET` | `/api/v1/health` | Headscale health check |
 
-All proxied requests require Headscale API key authentication:
+`GET /api/v1/node` is handled by `HandleProxyNodeList`, which injects `app_id` into each node entry. All other paths are forwarded by a generic proxy that preserves response headers/status codes from Headscale.
+
+### Calling the proxy endpoints
+
+- Construct the signing payload as `METHOD:/api/v1/path[?query][:BODY]` (the query string is required if present, just like `/admin/*` endpoints).
+- Reuse the nonce and timestamp headers from the Admin API flow.
+- Send the request to `${API_BASE_URL}/api/v1/...` with the same `Authorization`, `X-Nonce`, and `X-UTC-Timestamp` headers.
+
+**Example:** list nodes via the proxy:
 
 ```bash
-HS_KEY=$(docker compose exec headscale cat /shared/headscale_api_key)
+UTC_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 curl ${API_BASE_URL}/api/v1/node \
-  -H "Authorization: Bearer $HS_KEY"
+  -H "X-Nonce: $NONCE" \
+  -H "X-UTC-Timestamp: $UTC_TS" \
+  -H "Authorization: Bearer $(cast wallet sign --private-key $PRIV "$NONCE:$UTC_TS:GET:/api/v1/node")"
 ```
 
-**Response:**
+The response mirrors Headscale's output plus the injected `app_id` field:
+
 ```json
 {
   "nodes": [
@@ -279,8 +300,6 @@ curl ${API_BASE_URL}/api/v1/node \
   ]
 }
 ```
-
-**Note:** The `app_id` field is injected by vpc-api-server and is not part of the standard Headscale API response.
 
 ---
 

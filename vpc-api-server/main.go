@@ -24,7 +24,7 @@ import (
 )
 
 type Config struct {
-	OwnerAddress string // 管理员钱包地址
+	OwnerAddress string // Admin wallet address
 	DataDir      string
 }
 
@@ -44,7 +44,7 @@ type BootstrapResponse struct {
 type AppState struct {
 	config       Config
 	nodes        map[string]NodeInfo
-	allowedApps  map[string]bool   // 动态 allowlist
+	allowedApps  map[string]bool   // Dynamic allowlist
 	nodeAppMap   map[string]string // node_name -> app_id mapping
 	mutex        sync.RWMutex
 	sharedKey    string
@@ -55,7 +55,7 @@ type AppState struct {
 	httpClient   *http.Client
 }
 
-// Request for allowlist operations (由管理员签名授权)
+// Request for allowlist operations (signed by admin wallet)
 type AllowlistRequest struct {
 	AppID string `json:"app_id"`
 }
@@ -70,6 +70,7 @@ type NonceResponse struct {
 const (
 	nonceTTL         = 24 * time.Hour
 	maxTimestampSkew = 30 * time.Second
+	maxProxyBodySize = 1 << 20 // 1 MiB limit for admin-proxied requests
 )
 
 type DstackInfo struct {
@@ -202,6 +203,108 @@ func (s *AppState) authorizeAdminRequest(c *gin.Context, payload []byte) bool {
 }
 
 // ============================================================================
+// Headscale API Whitelist
+// ============================================================================
+
+// AllowedAPI represents an allowed headscale API endpoint
+type AllowedAPI struct {
+	Method  string
+	Pattern string // URL pattern, supports :param for path parameters
+}
+
+// Whitelist of allowed headscale APIs (all require wallet signature)
+var headscaleAPIWhitelist = []AllowedAPI{
+	// Node management
+	{"GET", "/api/v1/node"},
+	{"GET", "/api/v1/node/:nodeId"},
+	{"DELETE", "/api/v1/node/:nodeId"},
+	{"POST", "/api/v1/node/:nodeId/tags"},
+	{"POST", "/api/v1/node/:nodeId/approve_routes"},
+
+	// Policy management
+	{"GET", "/api/v1/policy"},
+	{"PUT", "/api/v1/policy"},
+
+	// Health check (can be public, but included for completeness)
+	{"GET", "/api/v1/health"},
+}
+
+// isAPIAllowed checks if the request matches the whitelist
+func isAPIAllowed(method, path string) bool {
+	for _, allowed := range headscaleAPIWhitelist {
+		if allowed.Method != method {
+			continue
+		}
+
+		// Simple pattern matching: replace :param with wildcard
+		pattern := allowed.Pattern
+		if strings.Contains(pattern, ":") {
+			// Convert /api/v1/node/:nodeId to regex pattern
+			// For simplicity, we'll use a basic string-based check
+			parts := strings.Split(pattern, "/")
+			pathParts := strings.Split(path, "/")
+
+			if len(parts) != len(pathParts) {
+				continue
+			}
+
+			match := true
+			for i, part := range parts {
+				if strings.HasPrefix(part, ":") {
+					// This is a parameter, matches anything
+					continue
+				}
+				if part != pathParts[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		} else {
+			// Exact match
+			if pattern == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// buildSignedPayload creates the canonical string used for wallet signature verification.
+func buildSignedPayload(method, path, rawQuery string, body []byte) []byte {
+	payload := method + ":" + path
+	if rawQuery != "" {
+		payload += "?" + rawQuery
+	}
+	if len(body) > 0 {
+		payload += ":" + string(body)
+	}
+	return []byte(payload)
+}
+
+func shouldSkipAppAuth(path string) bool {
+	return path == "/health" ||
+		strings.HasPrefix(path, "/admin/") ||
+		strings.HasPrefix(path, "/api/v1/")
+}
+
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+func readRequestBodyLimited(r io.Reader, maxSize int64) ([]byte, error) {
+	limitedReader := io.LimitReader(r, maxSize+1)
+	bodyBytes, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(bodyBytes)) > maxSize {
+		return nil, errRequestBodyTooLarge
+	}
+	return bodyBytes, nil
+}
+
+// ============================================================================
 // Admin authentication (nonce + signature)
 // ============================================================================
 
@@ -229,7 +332,7 @@ func (s *AppState) HandleGetNonce(c *gin.Context) {
 }
 
 // ============================================================================
-// Allowlist Management (需要管理员签名)
+// Allowlist Management (requires admin signature)
 // ============================================================================
 
 func (s *AppState) HandleCreateAllowlist(c *gin.Context) {
@@ -325,7 +428,7 @@ func (s *AppState) HandleDeleteAllowlist(c *gin.Context) {
 }
 
 func (s *AppState) HandleGetNodes(c *gin.Context) {
-	payload := []byte("GET:/admin/nodes")
+	payload := buildSignedPayload("GET", "/admin/nodes", c.Request.URL.RawQuery, nil)
 	if !s.authorizeAdminRequest(c, payload) {
 		return
 	}
@@ -337,9 +440,68 @@ func (s *AppState) HandleGetNodes(c *gin.Context) {
 		return
 	}
 
-	// 注入内部使用的 API Key 后重用现有逻辑
-	c.Request.Header.Set("Authorization", "Bearer "+apiKey)
-	s.HandleProxyNodeList(c)
+	// Request headscale API directly
+	targetURL := s.headscaleURL + "/api/v1/node"
+	if c.Request.URL.RawQuery != "" {
+		targetURL += "?" + c.Request.URL.RawQuery
+	}
+
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		log.Printf("Failed to create request: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		log.Printf("Headscale request failed: %v", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Headscale unavailable"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Failed to read response: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal error"})
+		return
+	}
+
+	// If not 200, return original response
+	if resp.StatusCode != http.StatusOK {
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		return
+	}
+
+	// Parse JSON
+	var nodesResp struct {
+		Nodes []map[string]interface{} `json:"nodes"`
+	}
+
+	if err := json.Unmarshal(body, &nodesResp); err != nil {
+		log.Printf("Failed to parse nodes response: %v", err)
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		return
+	}
+
+	// Inject app_id for each node
+	s.mutex.RLock()
+	for i := range nodesResp.Nodes {
+		nodeName, ok := nodesResp.Nodes[i]["name"].(string)
+		if !ok {
+			continue
+		}
+		if appID, exists := s.nodeAppMap[nodeName]; exists {
+			nodesResp.Nodes[i]["app_id"] = appID
+		}
+	}
+	s.mutex.RUnlock()
+
+	log.Printf("Admin GET /admin/nodes -> 200 (returned %d nodes with app_id)", len(nodesResp.Nodes))
+	c.JSON(http.StatusOK, nodesResp)
 }
 
 // Persist allowlist to disk
@@ -651,77 +813,130 @@ func getOrCreateSharedKey() string {
 }
 
 // ============================================================================
-// Headscale API Proxy
+// Headscale API Proxy (with whitelist + wallet signature verification)
 // ============================================================================
 
-// 通用代理：转发请求到 headscale
+// HandleProxyHeadscale proxies allowed headscale API requests with admin authentication
 func (s *AppState) HandleProxyHeadscale(c *gin.Context) {
-	// 验证是否有 API Key（只有管理员可以访问）
-	apiKey := c.GetHeader("Authorization")
-	if !strings.HasPrefix(apiKey, "Bearer ") {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	method := c.Request.Method
+	path := c.Request.URL.Path
+
+	// Check if API is in whitelist
+	if !isAPIAllowed(method, path) {
+		log.Printf("Blocked non-whitelisted API request: %s %s", method, path)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "API not allowed",
+			"message": "This headscale API endpoint is not exposed through this server",
+		})
 		return
 	}
 
-	// 构造目标 URL
-	targetURL := s.headscaleURL + c.Request.URL.Path
+	// Read request body for signature verification with size limit
+	bodyBytes, err := readRequestBodyLimited(c.Request.Body, maxProxyBodySize)
+	if err != nil {
+		if errors.Is(err, errRequestBodyTooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		}
+		return
+	}
+	// Restore body for later use
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Verify wallet signature (admin authentication required)
+	payload := buildSignedPayload(method, path, c.Request.URL.RawQuery, bodyBytes)
+	if !s.authorizeAdminRequest(c, payload) {
+		return
+	}
+
+	// Get headscale API key for backend request
+	apiKey, err := s.getAPIKey()
+	if err != nil {
+		log.Printf("Failed to load headscale API key: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "headscale API key not available"})
+		return
+	}
+
+	// Construct target URL
+	targetURL := s.headscaleURL + path
 	if c.Request.URL.RawQuery != "" {
 		targetURL += "?" + c.Request.URL.RawQuery
 	}
 
-	// 创建新请求
-	req, err := http.NewRequest(c.Request.Method, targetURL, c.Request.Body)
+	// Create proxy request
+	proxyReq, err := http.NewRequest(method, targetURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		log.Printf("Failed to create proxy request: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Proxy error"})
 		return
 	}
 
-	// 复制 headers（特别是 Authorization）
+	// Set headscale API authorization
+	proxyReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	// Copy relevant headers (excluding client auth headers)
 	for key, values := range c.Request.Header {
+		// Skip client authentication headers
+		if key == "Authorization" || key == "X-Nonce" || key == "X-Utc-Timestamp" {
+			continue
+		}
 		for _, value := range values {
-			req.Header.Add(key, value)
+			proxyReq.Header.Add(key, value)
 		}
 	}
 
-	// 发送请求
-	resp, err := s.httpClient.Do(req)
+	// Send request to headscale
+	resp, err := s.httpClient.Do(proxyReq)
 	if err != nil {
-		log.Printf("Proxy request failed: %v", err)
+		log.Printf("Proxy request to headscale failed: %v", err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Headscale unavailable"})
 		return
 	}
 	defer resp.Body.Close()
 
-	// 复制响应 headers
+	// Copy response headers
 	for key, values := range resp.Header {
 		for _, value := range values {
 			c.Header(key, value)
 		}
 	}
 
-	// 读取并返回响应
-	body, err := io.ReadAll(resp.Body)
+	// Read and return response
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("Failed to read proxy response: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Proxy error"})
 		return
 	}
 
-	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	log.Printf("Proxied %s %s -> %d", method, path, resp.StatusCode)
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 }
 
-// 特殊处理：Node List - 注入 app_id
+// HandleProxyNodeList handles GET /api/v1/node with wallet signature verification and app_id injection
 func (s *AppState) HandleProxyNodeList(c *gin.Context) {
-	// 验证 API Key
-	apiKey := c.GetHeader("Authorization")
-	if !strings.HasPrefix(apiKey, "Bearer ") {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+	path := "/api/v1/node"
+	method := "GET"
+
+	// Build signature payload (include query)
+	payload := buildSignedPayload(method, path, c.Request.URL.RawQuery, nil)
+
+	// Verify wallet signature (admin authentication required)
+	if !s.authorizeAdminRequest(c, payload) {
 		return
 	}
 
-	// 请求 headscale API
-	targetURL := s.headscaleURL + "/api/v1/node"
+	// Get headscale API key for backend request
+	apiKey, err := s.getAPIKey()
+	if err != nil {
+		log.Printf("Failed to load headscale API key: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "headscale API key not available"})
+		return
+	}
+
+	// Request headscale API
+	targetURL := s.headscaleURL + path
 	if c.Request.URL.RawQuery != "" {
 		targetURL += "?" + c.Request.URL.RawQuery
 	}
@@ -733,7 +948,7 @@ func (s *AppState) HandleProxyNodeList(c *gin.Context) {
 		return
 	}
 
-	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -750,25 +965,25 @@ func (s *AppState) HandleProxyNodeList(c *gin.Context) {
 		return
 	}
 
-	// 如果不是 200，直接返回原始响应
+	// If not 200, return original response
 	if resp.StatusCode != http.StatusOK {
 		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		return
 	}
 
-	// 解析 JSON
+	// Parse JSON
 	var nodesResp struct {
 		Nodes []map[string]interface{} `json:"nodes"`
 	}
 
 	if err := json.Unmarshal(body, &nodesResp); err != nil {
 		log.Printf("Failed to parse nodes response: %v", err)
-		// 返回原始响应
+		// Return original response
 		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 		return
 	}
 
-	// 注入 app_id
+	// Inject app_id for each node
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
@@ -778,13 +993,13 @@ func (s *AppState) HandleProxyNodeList(c *gin.Context) {
 			continue
 		}
 
-		// 查找对应的 app_id
+		// Find corresponding app_id
 		if appID, exists := s.nodeAppMap[nodeName]; exists {
 			nodesResp.Nodes[i]["app_id"] = appID
 		}
 	}
 
-	// 返回修改后的 JSON
+	log.Printf("Proxied GET /api/v1/node -> 200 (injected app_id for %d nodes)", len(nodesResp.Nodes))
 	c.JSON(http.StatusOK, nodesResp)
 }
 
@@ -864,9 +1079,10 @@ func main() {
 	// Middleware: Check app_id for node registration
 	// ========================================================================
 	r.Use(func(c *gin.Context) {
-		// Skip auth for health and management endpoints
-		if c.Request.URL.Path == "/health" ||
-			strings.HasPrefix(c.Request.URL.Path, "/admin/") {
+		path := c.Request.URL.Path
+
+		// Skip auth for health, admin endpoints, and admin headscale proxy (/api/v1/*)
+		if shouldSkipAppAuth(path) {
 			c.Next()
 			return
 		}
@@ -921,11 +1137,11 @@ func main() {
 
 		state.mutex.Lock()
 		state.nodes[instanceUUID] = nodeInfo
-		// 记录 node_name -> app_id 映射
+		// Track node_name -> app_id mapping
 		state.nodeAppMap[nodeName] = appID
 		state.mutex.Unlock()
 
-		// 持久化 node mapping
+		// Persist node mapping
 		if err := state.saveAllowlist(); err != nil {
 			log.Printf("Warning: failed to save node mapping: %v", err)
 		}
@@ -941,22 +1157,26 @@ func main() {
 	})
 
 	// ========================================================================
-	// Admin Endpoints (需要签名认证)
+	// Admin Endpoints (require signature)
 	// ========================================================================
-	r.GET("/admin/nonce", state.HandleGetNonce)             // 获取 nonce
-	r.POST("/admin/allowlist", state.HandleCreateAllowlist) // 添加 allowlist
-	r.GET("/admin/allowlist", state.HandleGetAllowlist)     // 查看 allowlist
+	r.GET("/admin/nonce", state.HandleGetNonce)             // Issue nonce
+	r.POST("/admin/allowlist", state.HandleCreateAllowlist) // Add allowlist entry
+	r.GET("/admin/allowlist", state.HandleGetAllowlist)     // View allowlist
 	r.DELETE("/admin/allowlist/:app_id", state.HandleDeleteAllowlist)
-	r.GET("/admin/nodes", state.HandleGetNodes) // 查看节点列表
+	r.GET("/admin/nodes", state.HandleGetNodes) // View nodes
 
 	// ========================================================================
-	// Headscale API Proxy (需要 API Key 或 Admin 权限)
+	// Headscale API Proxy (whitelist + wallet signature validation)
 	// ========================================================================
+	// Every /api/v1/* request must:
+	// 1. Match the whitelist defined in headscaleAPIWhitelist
+	// 2. Pass wallet signature verification (admin privileges)
+	// 3. Avoid restricted APIs (apikey/user/preauthkey management is blocked)
 
-	// 特殊处理：GET /api/v1/node - 注入 app_id
+	// Special case: GET /api/v1/node injects app_id
 	r.GET("/api/v1/node", state.HandleProxyNodeList)
 
-	// 通用代理：转发其他 /api/v1/... 请求到 headscale
+	// Generic proxy: forward whitelisted /api/v1/* requests to headscale
 	r.NoRoute(func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/api/v1/") {
 			state.HandleProxyHeadscale(c)
