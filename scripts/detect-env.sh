@@ -1,9 +1,10 @@
 #!/bin/bash
 
 get_container_id() {
-    if [ -f /proc/1/cgroup ]; then
-        grep -o 'docker/[^/]*' /proc/1/cgroup | head -1 | cut -d'/' -f2
-    fi
+    # Works on both cgroup v1 and v2: Docker bind-mounts /etc/hostname and
+    # /etc/resolv.conf from /var/lib/docker/containers/<id>/, which is
+    # visible in /proc/1/mountinfo regardless of cgroup version.
+    grep -o '/docker/containers/[^/]*' /proc/1/mountinfo | head -n 1 | cut -d'/' -f4
 }
 
 DSTACK_CONTAINER_ID=$(get_container_id)
